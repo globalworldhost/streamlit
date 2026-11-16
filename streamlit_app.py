@@ -791,6 +791,20 @@ def generate_links(argo_domain):
 
     sub_path.write_text(sub_txt_b64, encoding='utf-8')
     list_path.write_text(sub_txt, encoding='utf-8')
+    # --- Streamlit 页面持久化: list.txt 会在 90 秒后被 clean_files() 删掉,
+    # 所以把隧道域名和解码后的节点另外存一份, 不会被清理, 供页面读取 ---
+    try:
+        if argo_domain:
+            (FILE_PATH / 'argo_domain.txt').write_text(argo_domain, encoding='utf-8')
+        (FILE_PATH / 'nodes.txt').write_text(sub_txt, encoding='utf-8')
+        (FILE_PATH / 'status.json').write_text(json.dumps({
+            'argo_domain': argo_domain or '',
+            'uuid': UUID,
+            'updated_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            'sub_b64_len': len(sub_txt_b64),
+        }, ensure_ascii=False), encoding='utf-8')
+    except Exception as e:
+        log_error(f'Failed to persist subscription for Streamlit page: {e}')
     log(f'{FILE_PATH}/sub.txt saved successfully')
 
     sub_txt_content = sub_txt_b64
@@ -973,11 +987,140 @@ def stop_all(signum=None, frame=None):
     t = threading.Thread(target=shutdown, daemon=True)
     t.start()
 
+# =========================== Streamlit 页面: 订阅查看 + 保活 ===========================
+# 关键: Streamlit 脚本每次交互都会从头重跑一次, 所以后台只能启动一次,
+# 主线程绝不能 serve_forever() 阻塞, 否则页面永远是空白.
+try:
+    import streamlit as st
+    _ST_AVAILABLE = True
+except Exception:
+    st = None
+    _ST_AVAILABLE = False
+
+_BACKEND_STARTED = False
+_BACKEND_STARTED_AT = None
+_HTTP_SERVER = None
+
+def _start_backend_once():
+    """只启动一次: 订阅 HTTP 服务(3000 端口, 后台线程) + 主流程(后台线程)."""
+    global _BACKEND_STARTED, _BACKEND_STARTED_AT, _HTTP_SERVER
+    if _BACKEND_STARTED:
+        return
+    _BACKEND_STARTED = True
+    _BACKEND_STARTED_AT = datetime.datetime.now(datetime.timezone.utc)
+    ThreadingHTTPServer.allow_reuse_address = True
+    try:
+        _HTTP_SERVER = ThreadingHTTPServer(('0.0.0.0', PORT), RequestHandler)
+        threading.Thread(target=_HTTP_SERVER.serve_forever, daemon=True).start()
+        always_log(f'server is running on {PORT}!')
+    except OSError as e:
+        log(f'server bind failed on {PORT}: {e} (Streamlit 页面不受影响, 后台主流程继续跑)')
+    threading.Thread(target=start_server, daemon=True).start()
+
+def _load_subscription():
+    """读 sub.txt (base64) 并解码, 返回 (b64, [节点链接...], 状态文件)."""
+    status = {}
+    try:
+        if (FILE_PATH / 'status.json').exists():
+            status = json.loads((FILE_PATH / 'status.json').read_text(encoding='utf-8'))
+    except Exception:
+        pass
+    if not sub_path.exists():
+        return '', [], status
+    try:
+        b64 = sub_path.read_text(encoding='utf-8').strip()
+        decoded = base64.b64decode(b64).decode('utf-8', errors='ignore')
+        lines = [ln.strip() for ln in decoded.splitlines() if ln.strip()]
+        return b64, lines, status
+    except Exception:
+        # sub.txt 可能还没写完, 直接读 nodes.txt 兜底
+        try:
+            txt = (FILE_PATH / 'nodes.txt').read_text(encoding='utf-8')
+            return '', [ln.strip() for ln in txt.splitlines() if ln.strip()], status
+        except Exception:
+            return '', [], status
+
+def _load_argo_domain(status=None):
+    if status and status.get('argo_domain'):
+        return status['argo_domain']
+    try:
+        p = FILE_PATH / 'argo_domain.txt'
+        if p.exists():
+            return p.read_text(encoding='utf-8').strip()
+    except Exception:
+        pass
+    return ARGO_DOMAIN or ''
+
+def _render_streamlit_ui():
+    st.set_page_config(page_title='节点订阅 · 保活', page_icon='🚀', layout='centered')
+    # ?page=sub 只显示订阅, 方便当作订阅查看路径用
+    try:
+        page = st.query_params.get('page', '')
+    except Exception:
+        page = ''
+    b64, links, status = _load_subscription()
+    argo_domain = _load_argo_domain(status)
+    now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+    ready = bool(links)
+
+    if page == 'sub':
+        st.title('📡 订阅')
+        if not ready:
+            st.warning('订阅还没生成, 后台正在启动 Xray / Cloudflared, 等 1-2 分钟后点刷新再看。')
+        else:
+            st.code(b64, language='text')
+            st.download_button('下载 sub.txt', data=b64, file_name='sub.txt', mime='text/plain')
+            for ln in links:
+                st.code(ln, language='text')
+        if st.button('🔄 刷新', key='refresh_sub'):
+            st.rerun()
+        st.caption(f'最后查看: {now} · 访问本页即保活')
+        return
+
+    st.title('🚀 python-xray-argo')
+    st.caption('打开本页 = 访问了 Streamlit 应用, 可以把它当作保活入口。Streamlit Cloud 12 小时无访问会休眠, 需定期访问本页唤醒。')
+
+    if ready:
+        st.success(f'✅ 订阅已生成 · {len(links)} 条节点 · 最后查看 {now}')
+    else:
+        st.warning('⏳ 后台启动中: Xray / Cloudflared 还没生成订阅, 一般 1-2 分钟, 点下面刷新再看。日志里出现 ArgoDomain 即表示隧道已通。')
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric('隧道域名', argo_domain or '生成中…')
+    with col2:
+        st.metric('订阅端口 (容器内)', str(PORT))
+    if _BACKEND_STARTED_AT:
+        st.caption(f'后台启动于: {_BACKEND_STARTED_AT.strftime("%Y-%m-%d %H:%M:%S UTC")} · UUID: {UUID}')
+
+    if argo_domain:
+        st.subheader('订阅地址 (走隧道, 客户端用这个)')
+        st.code(f'https://{argo_domain}/sub', language='text')
+        st.caption('注意: streamlit.app/sub 不是订阅地址, Streamlit 会自己接管这个路径, 订阅只能走上面这个隧道域名。')
+
+    st.subheader('📡 节点链接')
+    if not ready:
+        st.info('还没有节点, 先等后台生成。')
+    else:
+        for ln in links:
+            st.code(ln, language='text')
+
+    with st.expander('原始订阅 (base64, 复制到客户端)'):
+        st.code(b64, language='text')
+        st.download_button('下载 sub.txt', data=b64, file_name='sub.txt', mime='text/plain')
+
+    st.subheader('💓 保活')
+    st.write(f'当前时间: {now}')
+    st.write('后台线程: 已启动' if _BACKEND_STARTED else '后台线程: 未启动')
+    st.write('订阅 HTTP 服务: ' + ('运行中' if _HTTP_SERVER else '未绑定 (不影响页面, 订阅走隧道)'))
+    st.caption('保活原理: 每次打开/刷新本页, Streamlit 都会重跑脚本并确认后台还在; 但 Streamlit Cloud 本身 12 小时无流量会休眠, 所以要靠外部定时访问本页 (或开 AUTO_ACCESS + PROJECT_URL) 来唤醒, 页面本身不能让平台不休眠。')
+    if st.button('🔄 刷新状态'):
+        st.rerun()
+    st.caption('⚠️ 本页包含完整 UUID 和节点链接, 不要公开分享。')
+
 # =========================== 入口 ===========================
 if __name__ == '__main__':
     # --- Streamlit Cloud 适配 1: signal 只能在主线程注册 ---
-    # Streamlit 用 streamlit run 跑脚本, 脚本在 ScriptRunner 线程里,
-    # 直接 signal.signal() 会报 ValueError: signal only works in main thread
     if threading.current_thread() is threading.main_thread():
         try:
             signal.signal(signal.SIGINT, stop_all)
@@ -985,26 +1128,13 @@ if __name__ == '__main__':
         except ValueError:
             pass
 
-    # --- Streamlit Cloud 适配 2: 端口绑定失败不再直接崩 ---
-    # 8501 已被 Streamlit 占用, 或 Streamlit 重跑脚本时旧实例还没释放端口,
-    # 都会在 bind() 报 OSError [Errno 98] Address already in use.
-    # 绑不上就不再崩掉整个应用: 先跑后台主流程, 再原地保活等着.
-    ThreadingHTTPServer.allow_reuse_address = True
-    server = None
-    try:
-        server = ThreadingHTTPServer(('0.0.0.0', PORT), RequestHandler)
-    except OSError as e:
-        log(f'server bind failed on {PORT}: {e}')
-        t = threading.Thread(target=start_server, daemon=True)
-        t.start()
+    # 后台只启动一次, 主线程不再 serve_forever() 阻塞
+    _start_backend_once()
+
+    if _ST_AVAILABLE:
+        # Streamlit 模式: 主线程渲染页面, 后台线程跑代理
+        _render_streamlit_ui()
+    else:
+        # 纯 python app.py 模式: 没有 Streamlit, 原地保活
         while True:
             time.sleep(3600)
-
-    always_log(f'server is running on {PORT}!')
-
-    # 在后台线程中启动主流程
-    t = threading.Thread(target=start_server, daemon=True)
-    t.start()
-
-    # 主线程阻塞在 HTTP 服务器上
-    server.serve_forever()
