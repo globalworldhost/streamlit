@@ -46,6 +46,9 @@ NAME = os.environ.get('NAME', '')                      # 节点名称
 CHAT_ID = os.environ.get('CHAT_ID', '')                # Telegram chat_id
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '')            # Telegram bot_token
 PORT = int(os.environ.get('PORT') or '3000')           # http订阅端口
+# --- Streamlit Cloud 适配: Streamlit 自己占 8501, 订阅服务绝不能绑 8501 ---
+if PORT == 8501:
+    PORT = 3000
 SHOW_LOG = os.environ.get('SHOW_LOG', 'true').lower() not in ('false', 'disable', 'no')  # 是否显示日志,默认显示，no/false/disable 不显示
 
 # =========================== 日志控制 ===========================
@@ -972,6 +975,9 @@ def stop_all(signum=None, frame=None):
 
 # =========================== 入口 ===========================
 if __name__ == '__main__':
+    # --- Streamlit Cloud 适配 1: signal 只能在主线程注册 ---
+    # Streamlit 用 streamlit run 跑脚本, 脚本在 ScriptRunner 线程里,
+    # 直接 signal.signal() 会报 ValueError: signal only works in main thread
     if threading.current_thread() is threading.main_thread():
         try:
             signal.signal(signal.SIGINT, stop_all)
@@ -979,8 +985,20 @@ if __name__ == '__main__':
         except ValueError:
             pass
 
-    # 启动 HTTP 服务 (主线程)
-    server = ThreadingHTTPServer(('0.0.0.0', PORT), RequestHandler)
+    # --- Streamlit Cloud 适配 2: 端口绑定失败不再直接崩 ---
+    # 8501 已被 Streamlit 占用, 或 Streamlit 重跑脚本时旧实例还没释放端口,
+    # 都会在 bind() 报 OSError [Errno 98] Address already in use.
+    # 绑不上就不再崩掉整个应用: 先跑后台主流程, 再原地保活等着.
+    ThreadingHTTPServer.allow_reuse_address = True
+    server = None
+    try:
+        server = ThreadingHTTPServer(('0.0.0.0', PORT), RequestHandler)
+    except OSError as e:
+        log(f'server bind failed on {PORT}: {e}')
+        t = threading.Thread(target=start_server, daemon=True)
+        t.start()
+        while True:
+            time.sleep(3600)
 
     always_log(f'server is running on {PORT}!')
 
