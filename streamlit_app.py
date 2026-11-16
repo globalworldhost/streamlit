@@ -18,7 +18,6 @@ import datetime
 import requests
 from pathlib import Path
 from urllib.parse import urlparse, quote
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from cryptography.hazmat.primitives.asymmetric import x25519, ec
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography import x509
@@ -45,11 +44,7 @@ CFPORT = int(os.environ.get('CFPORT', '443'))          # 优选端口
 NAME = os.environ.get('NAME', '')                      # 节点名称
 CHAT_ID = os.environ.get('CHAT_ID', '')                # Telegram chat_id
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '')            # Telegram bot_token
-PORT = int(os.environ.get('PORT') or '3000')           # http订阅端口
-# --- Streamlit Cloud 适配: Streamlit 自己占 8501, 订阅服务绝不能绑 8501 ---
-if PORT == 8501:
-    PORT = 3000
-SHOW_LOG = os.environ.get('SHOW_LOG', 'true').lower() not in ('false', 'disable', 'no')  # 是否显示日志,默认显示，no/false/disable 不显示
+SHOW_LOG = os.environ.get('SHOW_LOG', 'true').lower() not in ('false', 'disable', 'no')  # 是否显示日志
 
 # =========================== 日志控制 ===========================
 def log(msg):
@@ -104,7 +99,6 @@ def is_valid_port(port):
 
 # =========================== X25519 密钥对生成 ===========================
 def generate_x25519_keypair():
-    """使用 cryptography 库生成 X25519 密钥对,返回 base64url 编码的私钥和公钥"""
     priv = x25519.X25519PrivateKey.generate()
     pub = priv.public_key()
     priv_bytes = priv.private_bytes(
@@ -122,7 +116,6 @@ def generate_x25519_keypair():
     }
 
 def generate_or_load_keypair():
-    """生成或加载 X25519 密钥对"""
     global private_key, public_key
     key_file_path = FILE_PATH / 'key.txt'
     if key_file_path.exists():
@@ -169,7 +162,6 @@ FALLBACK_CERT = (
 )
 
 def ensure_tls_certificates(cert_file, key_file):
-    """生成自签名 TLS 证书 (用于 Hysteria2)"""
     if cert_file.exists() and key_file.exists():
         return
     cert_file.parent.mkdir(parents=True, exist_ok=True)
@@ -203,7 +195,6 @@ def ensure_tls_certificates(cert_file, key_file):
 
 # =========================== 证书指纹计算 ===========================
 def get_certificate_fingerprint(cert_file):
-    """计算证书的 SHA-256 指纹,优先用 openssl,不可用时用 cryptography 兜底"""
     try:
         result = subprocess.run(
             ['openssl', 'x509', '-noout', '-fingerprint', '-sha256', '-in', str(cert_file)],
@@ -231,7 +222,6 @@ def create_directory():
     if not SHOW_LOG:
         print('\033c', end='')
     FILE_PATH.mkdir(parents=True, exist_ok=True)
-    # log(f'{FILE_PATH} is ready')
 
 # =========================== 删除旧节点 ===========================
 def delete_nodes():
@@ -253,8 +243,6 @@ def delete_nodes():
 
 # =========================== 清理历史文件 ===========================
 def cleanup_old_files():
-    """清理 FILE_PATH 目录下的所有文件, 保留 key.txt/cert.pem/private.key"""
-    # key.txt: Reality 密钥对, cert.pem/private.key: Hysteria2 证书, 删除后重启指纹变化导致节点失效
     preserve_files = {FILE_PATH / 'key.txt', cert_path, key_path}
     try:
         for item in FILE_PATH.iterdir():
@@ -297,7 +285,6 @@ def download_file(file_name, file_url):
         return False
 
 def download_all_files():
-    """下载所需二进制文件"""
     architecture = get_system_architecture()
     if architecture == 'arm':
         base_urls = ['https://arm64.oooen.com', 'https://arm64.ssss.nyc.mn']
@@ -370,7 +357,7 @@ def generate_nezha_config():
     if not NEZHA_SERVER or not NEZHA_KEY:
         return
     if NEZHA_PORT:
-        return  # v0 模式不需要 config.yaml
+        return 
 
     nzport = NEZHA_SERVER.split(':')[-1] if ':' in NEZHA_SERVER else ''
     tls_ports = {'443', '8443', '2096', '2087', '2083', '2053'}
@@ -498,7 +485,6 @@ def generate_xray_config():
         ]
     }
 
-    # VLESS Reality 配置
     if is_valid_port(REALITY_PORT):
         config["inbounds"].append({
             "tag": "vless-reality-in",
@@ -523,7 +509,6 @@ def generate_xray_config():
             }
         })
 
-    # Hysteria2 配置
     if is_valid_port(HY2_PORT):
         config["inbounds"].append({
             "tag": "hysteria-in",
@@ -553,7 +538,6 @@ def generate_xray_config():
             }
         })
 
-    # SOCKS5 配置
     if is_valid_port(S5_PORT):
         config["inbounds"].append({
             "tag": "s5-in",
@@ -587,11 +571,8 @@ def exec_cmd(command):
 # =========================== 下载并运行 ===========================
 def download_files_and_run():
     architecture = get_system_architecture()
-
-    # 下载文件
     download_all_files()
 
-    # 授权执行权限
     files_to_authorize = [web_name, bot_name]
     if NEZHA_SERVER and NEZHA_KEY:
         if NEZHA_PORT:
@@ -600,10 +581,8 @@ def download_files_and_run():
             files_to_authorize.append(php_name)
     authorize_files(files_to_authorize)
 
-    # 生成 Nezha 配置
     generate_nezha_config()
 
-    # 运行 Nezha
     if NEZHA_SERVER and NEZHA_PORT and NEZHA_KEY:
         tls_ports = ['443', '8443', '2096', '2087', '2083', '2053']
         nezha_tls = '--tls' if NEZHA_PORT in tls_ports else ''
@@ -625,7 +604,6 @@ def download_files_and_run():
     else:
         log('NEZHA variable is empty, skipping running')
 
-    # 运行 Xray
     command = f'nohup {web_path} -c {config_path} >/dev/null 2>&1 &'
     try:
         exec_cmd(command)
@@ -634,7 +612,6 @@ def download_files_and_run():
     except Exception as e:
         log_error(f'web running error: {e}')
 
-    # 运行 Cloudflared
     if bot_path.exists():
         if re.match(r'^[A-Z0-9a-z=]{120,250}$', ARGO_AUTH):
             args = f"tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token {ARGO_AUTH}"
@@ -754,7 +731,6 @@ def generate_links(argo_domain):
 
     sub_txt = ''
 
-    # Argo 节点 (VLESS / VMess / Trojan)
     if argo_domain:
         sub_txt += f'\nvless://{UUID}@{CFIP}:{CFPORT}?encryption=none&security=tls&sni={argo_domain}&fp=firefox&type=ws&host={argo_domain}&path=%2Fvless-argo%3Fed%3D2560#{node_name}'
 
@@ -769,17 +745,14 @@ def generate_links(argo_domain):
 
         sub_txt += f'\ntrojan://{UUID}@{CFIP}:{CFPORT}?security=tls&sni={argo_domain}&fp=firefox&type=ws&host={argo_domain}&path=%2Ftrojan-argo%3Fed%3D2560#{node_name}'
 
-    # Hysteria2 节点
     if is_valid_port(HY2_PORT):
         fingerprint = get_certificate_fingerprint(cert_path)
         fingerprint_param = f'&pinSHA256={quote(fingerprint, safe="")}' if fingerprint else ''
         sub_txt += f'\nhysteria2://{UUID}@{server_ip}:{HY2_PORT}/?sni=www.bing.com&insecure=0&alpn=h3&obfs=none{fingerprint_param}#{node_name}'
 
-    # Reality 节点
     if is_valid_port(REALITY_PORT):
         sub_txt += f'\nvless://{UUID}@{server_ip}:{REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk={public_key}&type=tcp&headerType=none#{node_name}'
 
-    # SOCKS5 节点
     if is_valid_port(S5_PORT):
         s5_auth = base64.b64encode(f'{UUID[:8]}:{UUID[-12:]}'.encode()).decode()
         sub_txt += f'\nsocks://{s5_auth}@{server_ip}:{S5_PORT}#{node_name}'
@@ -791,8 +764,6 @@ def generate_links(argo_domain):
 
     sub_path.write_text(sub_txt_b64, encoding='utf-8')
     list_path.write_text(sub_txt, encoding='utf-8')
-    # --- Streamlit 页面持久化: list.txt 会在 90 秒后被 clean_files() 删掉,
-    # 所以把隧道域名和解码后的节点另外存一份, 不会被清理, 供页面读取 ---
     try:
         if argo_domain:
             (FILE_PATH / 'argo_domain.txt').write_text(argo_domain, encoding='utf-8')
@@ -876,7 +847,6 @@ def add_visit_task():
 def clean_files():
     def cleanup():
         time.sleep(90)
-        # 注意: key.txt/cert.pem/private.key 不能删除, 删除后重启会导致 Reality 公钥和 Hysteria2 证书指纹变化, 节点失效
         files_to_delete = [boot_log_path, config_path, list_path, nezha_config_path,
                            web_path, bot_path,
                            FILE_PATH / 'tunnel.json', FILE_PATH / 'tunnel.yml']
@@ -899,77 +869,27 @@ def clean_files():
     t = threading.Thread(target=cleanup, daemon=True)
     t.start()
 
-# =========================== HTTP 服务 ===========================
-class RequestHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
-
-        if path == f'/{SUB_PATH}':
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/plain; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(sub_txt_content.encode('utf-8'))
-            return
-
-        if path == '/':
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(
-                b'Hello world!<br><br>You can access /{SUB_PATH}(Default: /sub) get your nodes!')
-            return
-
-        self.send_response(404)
-        self.send_header('Content-Type', 'text/plain; charset=utf-8')
-        self.end_headers()
-        self.wfile.write(b'Not Found')
-
-    def log_message(self, format, *args):
-        pass
-
 # =========================== 主流程 ===========================
 def start_server():
     global sub_txt_content
-
-    # 1. 删除旧节点
     delete_nodes()
-
-    # 2. 创建运行目录 + 清理文件
     create_directory()
     cleanup_old_files()
-
-    # 3. 生成 Argo 隧道配置
     argo_type()
-
-    # 4. 生成 Reality 密钥对 (仅当 REALITY_PORT 开启才生成)
     if is_valid_port(REALITY_PORT):
         generate_or_load_keypair()
-
-    # 5. 生成 TLS 证书 (用于 Hysteria2)
     if is_valid_port(HY2_PORT):
         ensure_tls_certificates(cert_path, key_path)
-
-    # 6. 生成 Xray 配置
     generate_xray_config()
-
-    # 7. 下载并运行文件
     download_files_and_run()
-
-    # 8. 提取隧道域名并生成节点
     extract_domains()
-
-    # 9. Telegram 推送 + 节点上传 + 自动保活
     send_telegram()
     upload_nodes()
     add_visit_task()
-
-    # 10. 90秒后清理文件
     clean_files()
 
 # =========================== 信号处理 ===========================
 def stop_all(signum=None, frame=None):
-    """优雅关闭所有服务"""
     def shutdown():
         log('\nShutting down...')
         try:
@@ -988,8 +908,6 @@ def stop_all(signum=None, frame=None):
     t.start()
 
 # =========================== Streamlit 页面: 订阅查看 + 保活 ===========================
-# 关键: Streamlit 脚本每次交互都会从头重跑一次, 所以后台只能启动一次,
-# 主线程绝不能 serve_forever() 阻塞, 否则页面永远是空白.
 try:
     import streamlit as st
     _ST_AVAILABLE = True
@@ -998,27 +916,16 @@ except Exception:
     _ST_AVAILABLE = False
 
 _BACKEND_STARTED = False
-_BACKEND_STARTED_AT = None
-_HTTP_SERVER = None
 
 def _start_backend_once():
-    """只启动一次: 订阅 HTTP 服务(3000 端口, 后台线程) + 主流程(后台线程)."""
-    global _BACKEND_STARTED, _BACKEND_STARTED_AT, _HTTP_SERVER
+    """只启动一次主流程(后台线程)，移除多余的 HTTP server"""
+    global _BACKEND_STARTED
     if _BACKEND_STARTED:
         return
     _BACKEND_STARTED = True
-    _BACKEND_STARTED_AT = datetime.datetime.now(datetime.timezone.utc)
-    ThreadingHTTPServer.allow_reuse_address = True
-    try:
-        _HTTP_SERVER = ThreadingHTTPServer(('0.0.0.0', PORT), RequestHandler)
-        threading.Thread(target=_HTTP_SERVER.serve_forever, daemon=True).start()
-        always_log(f'server is running on {PORT}!')
-    except OSError as e:
-        log(f'server bind failed on {PORT}: {e} (Streamlit 页面不受影响, 后台主流程继续跑)')
     threading.Thread(target=start_server, daemon=True).start()
 
 def _load_subscription():
-    """读 sub.txt (base64) 并解码, 返回 (b64, [节点链接...], 状态文件)."""
     status = {}
     try:
         if (FILE_PATH / 'status.json').exists():
@@ -1033,7 +940,6 @@ def _load_subscription():
         lines = [ln.strip() for ln in decoded.splitlines() if ln.strip()]
         return b64, lines, status
     except Exception:
-        # sub.txt 可能还没写完, 直接读 nodes.txt 兜底
         try:
             txt = (FILE_PATH / 'nodes.txt').read_text(encoding='utf-8')
             return '', [ln.strip() for ln in txt.splitlines() if ln.strip()], status
@@ -1052,21 +958,22 @@ def _load_argo_domain(status=None):
     return ARGO_DOMAIN or ''
 
 def _render_streamlit_ui():
-    st.set_page_config(page_title='节点订阅 · 保活', page_icon='🚀', layout='centered')
-    # ?page=sub 只显示订阅, 方便当作订阅查看路径用
+    st.set_page_config(page_title='绿色环保 · 保护地球', page_icon='🌿', layout='centered')
     try:
         page = st.query_params.get('page', '')
     except Exception:
         page = ''
+        
     b64, links, status = _load_subscription()
     argo_domain = _load_argo_domain(status)
     now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
     ready = bool(links)
 
-    if page == 'sub':
-        st.title('📡 订阅')
+    # 只有当 URL 后缀传入了对应参数才会显示节点（对应你的 SUB_PATH，默认为 sub）
+    if page == SUB_PATH:
+        st.title('📡 节点信息')
         if not ready:
-            st.warning('订阅还没生成, 后台正在启动 Xray / Cloudflared, 等 1-2 分钟后点刷新再看。')
+            st.warning('节点尚未生成，后台正在启动，请等待 1-2 分钟后刷新页面。')
         else:
             st.code(b64, language='text')
             st.download_button('下载 sub.txt', data=b64, file_name='sub.txt', mime='text/plain')
@@ -1074,53 +981,29 @@ def _render_streamlit_ui():
                 st.code(ln, language='text')
         if st.button('🔄 刷新', key='refresh_sub'):
             st.rerun()
-        st.caption(f'最后查看: {now} · 访问本页即保活')
+        st.caption(f'最后更新: {now}')
         return
 
-    st.title('🚀 python-xray-argo')
-    st.caption('打开本页 = 访问了 Streamlit 应用, 可以把它当作保活入口。Streamlit Cloud 12 小时无访问会休眠, 需定期访问本页唤醒。')
-
-    if ready:
-        st.success(f'✅ 订阅已生成 · {len(links)} 条节点 · 最后查看 {now}')
-    else:
-        st.warning('⏳ 后台启动中: Xray / Cloudflared 还没生成订阅, 一般 1-2 分钟, 点下面刷新再看。日志里出现 ArgoDomain 即表示隧道已通。')
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric('隧道域名', argo_domain or '生成中…')
-    with col2:
-        st.metric('订阅端口 (容器内)', str(PORT))
-    if _BACKEND_STARTED_AT:
-        st.caption(f'后台启动于: {_BACKEND_STARTED_AT.strftime("%Y-%m-%d %H:%M:%S UTC")} · UUID: {UUID}')
-
-    if argo_domain:
-        st.subheader('订阅地址 (走隧道, 客户端用这个)')
-        st.code(f'https://{argo_domain}/sub', language='text')
-        st.caption('注意: streamlit.app/sub 不是订阅地址, Streamlit 会自己接管这个路径, 订阅只能走上面这个隧道域名。')
-
-    st.subheader('📡 节点链接')
-    if not ready:
-        st.info('还没有节点, 先等后台生成。')
-    else:
-        for ln in links:
-            st.code(ln, language='text')
-
-    with st.expander('原始订阅 (base64, 复制到客户端)'):
-        st.code(b64, language='text')
-        st.download_button('下载 sub.txt', data=b64, file_name='sub.txt', mime='text/plain')
-
-    st.subheader('💓 保活')
-    st.write(f'当前时间: {now}')
-    st.write('后台线程: 已启动' if _BACKEND_STARTED else '后台线程: 未启动')
-    st.write('订阅 HTTP 服务: ' + ('运行中' if _HTTP_SERVER else '未绑定 (不影响页面, 订阅走隧道)'))
-    st.caption('保活原理: 每次打开/刷新本页, Streamlit 都会重跑脚本并确认后台还在; 但 Streamlit Cloud 本身 12 小时无流量会休眠, 所以要靠外部定时访问本页 (或开 AUTO_ACCESS + PROJECT_URL) 来唤醒, 页面本身不能让平台不休眠。')
-    if st.button('🔄 刷新状态'):
-        st.rerun()
-    st.caption('⚠️ 本页包含完整 UUID 和节点链接, 不要公开分享。')
+    # ======== 主页伪装: 绿色环保宣传 ========
+    st.title('🌿 保护环境，绿色地球')
+    # 插入一张环保风景图
+    st.image('https://images.unsplash.com/photo-1542601906990-b4d3fb778b09?w=800&q=80', use_container_width=True)
+    st.header('我们只有一个地球')
+    st.write('''
+    **绿色环保** 是我们每个人的责任。在全球气候变暖、资源日益枯竭的今天，采取积极的环保行动刻不容缓。
+    
+    * 🚲 **低碳出行**：多乘坐公共交通工具，骑自行车或步行，减少尾气排放。
+    * ♻️ **垃圾分类**：养成良好的垃圾分类习惯，促进资源回收再利用。
+    * 💧 **节约用水**：随手关紧水龙头，一水多用，珍惜每一滴水资源。
+    * 💡 **节约用电**：使用节能电器，人走灯灭，充分利用自然光。
+    * 🌳 **植树造林**：积极参与植树活动，为地球增添一抹绿色。
+    
+    让我们携手同行，从小事做起，共同守护美丽的蓝色星球！🌍
+    ''')
+    st.caption(f'当前时间: {now} | 保持热爱，奔赴山海')
 
 # =========================== 入口 ===========================
 if __name__ == '__main__':
-    # --- Streamlit Cloud 适配 1: signal 只能在主线程注册 ---
     if threading.current_thread() is threading.main_thread():
         try:
             signal.signal(signal.SIGINT, stop_all)
@@ -1128,13 +1011,10 @@ if __name__ == '__main__':
         except ValueError:
             pass
 
-    # 后台只启动一次, 主线程不再 serve_forever() 阻塞
     _start_backend_once()
 
     if _ST_AVAILABLE:
-        # Streamlit 模式: 主线程渲染页面, 后台线程跑代理
         _render_streamlit_ui()
     else:
-        # 纯 python app.py 模式: 没有 Streamlit, 原地保活
         while True:
             time.sleep(3600)
