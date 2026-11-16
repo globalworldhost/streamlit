@@ -973,11 +973,11 @@ def stop_all(signum=None, frame=None):
 # =========================== 入口 ===========================
 if __name__ == '__main__':
     if threading.current_thread() is threading.main_thread():
-    try:
-        signal.signal(signal.SIGINT, stop_all)
-        signal.signal(signal.SIGTERM, stop_all)
-    except ValueError:
-        pass
+        try:
+            signal.signal(signal.SIGINT, stop_all)
+            signal.signal(signal.SIGTERM, stop_all)
+        except ValueError:
+            pass
 
     # 启动 HTTP 服务 (主线程)
     server = ThreadingHTTPServer(('0.0.0.0', PORT), RequestHandler)
